@@ -27,6 +27,20 @@ def is_valid_url(url: str) -> bool:
         return False
 
 
+def is_doodstream_url(url: str) -> bool:
+    """Memvalidasi apakah URL mengarah ke format DoodStream yang diharapkan."""
+    if not is_valid_url(url):
+        return False
+    return "/e/" in url or "/d/" in url
+
+
+def sanitize_filename(name: str, max_length: int = 120) -> str:
+    """Membersihkan string agar aman dipakai sebagai nama file."""
+    name = re.sub(r'[\\/*?:"<>|]', "", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name[:max_length] if len(name) > max_length else name
+
+
 # ---------- Setup Logger ----------
 def setup_logger(level=logging.INFO):
     log_format = logging.Formatter(
@@ -74,14 +88,15 @@ class DoodStreamAPI:
                 media_url_base = await md5_response.text()
 
             token = pass_md5_path.split('/')[-1]
-            random_chars = ''.join(random.choices(
-                'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789', k=10))
+            random_chars = ''.join(
+                random.choices('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789', k=10)
+            )
             final_url = f"{media_url_base}{random_chars}?token={token}&expiry={int(time.time())}"
 
             soup = BeautifulSoup(html_content, "html.parser")
             title_tag = soup.find("title")
             title = title_tag.text.strip() if title_tag else token
-            title = re.sub(r'[\\/*?:"<>|]', "", title)
+            title = sanitize_filename(title)
 
             self.logger.info(f"Direct download link berhasil dibuat untuk '{title}'")
             return final_url, title
@@ -105,7 +120,7 @@ class DoodStreamFastDL:
     async def download(self) -> str:
         """Mengunduh video dan mengembalikan path file hasil unduhan."""
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ... Chrome/139.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
         }
         async with aiohttp.ClientSession(headers=headers) as session:
             api = DoodStreamAPI(session)
@@ -130,11 +145,14 @@ class DoodStreamFastDL:
             return final_path
 
     async def _download_file(self, session: aiohttp.ClientSession, url: str, path: str) -> None:
+        """Mengunduh file dari URL dengan dukungan resume otomatis."""
         try:
             existing_size = 0
             if os.path.exists(path):
                 existing_size = os.path.getsize(path)
                 self.logger.info(f"File sudah ada ({existing_size} bytes). Melanjutkan unduhan...")
+            else:
+                self.logger.info("Memulai unduhan baru...")
 
             headers = {}
             if existing_size > 0:
@@ -142,12 +160,12 @@ class DoodStreamFastDL:
 
             async with session.get(url, headers=headers, timeout=None) as response:
                 if existing_size > 0 and response.status == 200:
-                    self.logger.warning("Server tidak mendukung resume, mengunduh ulang.")
+                    self.logger.warning("Server tidak mendukung resume, mengunduh ulang dari awal.")
                     await self._restart_download(session, url, path)
                     return
 
                 if response.status == 416:
-                    self.logger.info("File sudah lengkap.")
+                    self.logger.info("File sudah lengkap, tidak perlu mengunduh lagi.")
                     return
 
                 response.raise_for_status()
@@ -159,8 +177,10 @@ class DoodStreamFastDL:
                     total_size = existing_size + int(response.headers["Content-Length"])
 
                 if total_size and existing_size >= total_size:
-                    self.logger.info("File sudah lengkap.")
+                    self.logger.info("File sudah lengkap, tidak perlu mengunduh lagi.")
                     return
+
+                self.logger.info("Memulai proses pengunduhan...")
 
                 mode = "ab" if existing_size > 0 else "wb"
                 progress_bar = None
@@ -170,25 +190,31 @@ class DoodStreamFastDL:
                         initial=existing_size,
                         unit="B",
                         unit_scale=True,
+                        unit_divisor=1024,
                         desc=os.path.basename(path)
                     )
 
                 async with aiofiles.open(path, mode) as f:
-                    async for chunk in response.content.iter_chunked(8192):
+                    chunk_size = 8192
+                    async for chunk in response.content.iter_chunked(chunk_size):
                         await f.write(chunk)
                         if progress_bar:
                             progress_bar.update(len(chunk))
 
                 if progress_bar:
                     progress_bar.close()
+
                 self.logger.info("Unduhan selesai.")
-        except Exception as e:
+        except aiohttp.ClientError as e:
             self.logger.error(f"Gagal mengunduh file: {e}")
+        except Exception as e:
+            self.logger.error(f"Terjadi kesalahan saat menyimpan file: {e}")
 
     async def _restart_download(self, session: aiohttp.ClientSession, url: str, path: str) -> None:
+        """Menghapus file yang ada dan memulai ulang unduhan dari awal."""
         try:
             os.remove(path)
-            self.logger.info("File lama dihapus, mulai unduhan baru.")
+            self.logger.info("File yang ada dihapus, memulai unduhan baru.")
         except OSError:
             pass
         await self._download_file(session, url, path)
@@ -204,17 +230,23 @@ async def upload_to_api(file_path: str, title: str) -> bool:
         try:
             data = aiohttp.FormData()
             data.add_field("title", title)
-            data.add_field("file", open(file_path, "rb"), filename=os.path.basename(file_path))
 
-            logger.info(f"Mengunggah {file_path} ke Videy...")
-            async with session.post(api_url, data=data) as resp:
-                resp_text = await resp.text()
-                if resp.status == 200:
-                    logger.info(f"Upload berhasil! Respon: {resp_text}")
-                    return True
-                else:
-                    logger.error(f"Upload gagal (HTTP {resp.status}): {resp_text}")
-                    return False
+            with open(file_path, "rb") as fp:
+                data.add_field(
+                    "file",
+                    fp,
+                    filename=os.path.basename(file_path),
+                    content_type="video/mp4"
+                )
+                logger.info(f"Mengunggah {file_path} ke Videy...")
+                async with session.post(api_url, data=data) as resp:
+                    resp_text = await resp.text()
+                    if resp.status == 200:
+                        logger.info(f"Upload berhasil! Respon: {resp_text}")
+                        return True
+                    else:
+                        logger.error(f"Upload gagal (HTTP {resp.status}): {resp_text}")
+                        return False
         except Exception as e:
             logger.error(f"Exception saat upload: {e}")
             return False
@@ -261,11 +293,19 @@ async def main():
 
     success_count = 0
     for idx, video in enumerate(videos, start=1):
+        if not isinstance(video, dict):
+            logging.warning(f"Data video #{idx} tidak valid, dilewati.")
+            continue
+
         iframe_src = video.get("iframe_src")
         original_title = video.get("title", "Tanpa Judul")
 
         if not iframe_src:
             logging.warning(f"Video #{idx} tidak memiliki iframe_src, dilewati.")
+            continue
+
+        if not is_doodstream_url(iframe_src):
+            logging.warning(f"Video #{idx} punya iframe_src tidak valid, dilewati: {iframe_src}")
             continue
 
         # Buat judul untuk upload: "1 || Chindo Cantik ..."
@@ -274,7 +314,7 @@ async def main():
         logging.info(f"=== Memproses #{idx}: {upload_title} ===")
 
         # Unduh video, nama file unik berdasarkan indeks
-        safe_part = re.sub(r'[\\/*?:"<>|]', "", original_title[:50])  # batasi panjang
+        safe_part = sanitize_filename(original_title[:50])  # batasi panjang
         local_filename = f"{idx:03d}_{safe_part}.mp4"
         local_path = output_dir / local_filename
 
